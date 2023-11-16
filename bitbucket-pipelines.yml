@@ -1,0 +1,77 @@
+image: python:3.7-slim
+
+definitions:
+  caches:
+    sonar: ~/.sonar/cache
+  services:
+    docker:
+      memory: 3072
+  steps:
+    - step: &run-unit-tests
+        name: Run Unit Tests
+        clone:
+          depth: full
+        caches:
+          - sonar
+        script:
+          - cd app
+          - pip install -r requirements.txt
+          - coverage run -m unittest discover tests
+          - coverage report
+          - coverage xml -o coverage.xml
+          - coveralls
+          - cd ..
+          - pipe: sonarsource/sonarcloud-scan:1.2.0
+          - pipe: sonarsource/sonarcloud-quality-gate:0.1.3
+    - step: &deploy
+        name: Build and Deploy to Cloud Run
+        image: google/cloud-sdk:alpine
+        services:
+          - docker
+        script:
+          - echo $DOCKER_PASSWORD | docker login --username=_json_key --password-stdin https://gcr.io
+          - echo $DEPLOYMENT_SERVICE_ACCOUNT_CREDENTIALS > service_account_key.json
+          - gcloud auth activate-service-account $DEPLOYMENT_SERVICE_ACCUNT_EMAIL --key-file service_account_key.json
+          - DOCKER_TAG="${BITBUCKET_TAG:-${BITBUCKET_COMMIT}}"
+          - ./build.sh $DOCKER_TAG
+          - ENV_FILE_FOLDER=$BITBUCKET_CLONE_DIR/environments/$BITBUCKET_DEPLOYMENT_ENVIRONMENT
+          - ./deploy.sh $DOCKER_TAG $ENV_FILE_FOLDER/insecure.env
+          - ./deploy.sh $DOCKER_TAG $ENV_FILE_FOLDER/secure.env
+    - step: &deploy-staging
+        <<: *deploy
+        deployment: staging
+    - step: &deploy-production
+        <<: *deploy
+        deployment: production
+    - step: &run-whitesource-agent
+        name: WhiteSource Scan
+        script:
+          - apt update && apt install gettext-base -y
+          - pipe: WhitesourceSoftware/whitesource-scan:1.3.0
+            variables:
+              API_KEY: $WS_API_KEY
+          - export WS_PROJECT_TOKEN=$(grep projectToken= wss-unified-agent.config | sed s/projectToken=//)
+          - pip install --extra-index-url=https://${PYPI_USERNAME}:${PYPI_PASSWORD}@pypi.com/pypi whitesource-sbom-report-generator==0.0.6
+          - echo $SOURCE_CODE_REPORT_ARCHIVE_CREDENTIALS > service_account.json
+          - export GOOGLE_APPLICATION_CREDENTIALS=service_account.json
+          - whitesource-sbom-report-generator source-code-reports $BITBUCKET_REPO_SLUG $BITBUCKET_COMMIT sbom.xlsx $WHITESOURCE_USER_KEY $WS_PROJECT_TOKEN
+        artifacts:
+          - sbom.xlsx
+
+pipelines:
+  default:
+    - parallel:
+      - step: *run-unit-tests
+      - step: *run-whitesource-agent
+  branches:
+    master:
+      - parallel:
+        - step: *run-unit-tests
+        - step: *run-whitesource-agent
+      - step: *deploy-staging
+  tags:
+    release/*:
+      - parallel:
+        - step: *run-unit-tests
+        - step: *run-whitesource-agent
+      - step: *deploy-production
